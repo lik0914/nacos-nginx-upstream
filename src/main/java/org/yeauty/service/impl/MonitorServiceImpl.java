@@ -4,6 +4,7 @@ import com.alibaba.nacos.api.NacosFactory;
 import com.alibaba.nacos.api.exception.NacosException;
 import com.alibaba.nacos.api.naming.NamingService;
 import com.alibaba.nacos.api.naming.pojo.Instance;
+import com.alibaba.nacos.common.utils.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +19,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -30,10 +32,10 @@ public class MonitorServiceImpl implements MonitorService {
 
     private static final String DEFAULT_SERVER = "127.0.0.1:65535";
 
-    private AtomicLong lastReloadTime = new AtomicLong(0);
+    private final AtomicLong lastReloadTime = new AtomicLong(0);
 
     @Override
-    public void updateNginxFromNacos(TomlParseResult tomlParseResult) throws IOException, InterruptedException, NacosException {
+    public void updateNginxFromNacos(TomlParseResult tomlParseResult) throws NacosException {
 
         boolean containNginxCmd = tomlParseResult.contains(NGINX_CMD);
         boolean containNacosAddr = tomlParseResult.contains(NACOS_ADDR);
@@ -44,12 +46,12 @@ public class MonitorServiceImpl implements MonitorService {
             throw new IllegalArgumentException(NACOS_ADDR + " is no such");
         }
 
-        //判断nginx的指令是否可用
+        // 判断nginx的指令是否可用
         String cmd = tomlParseResult.getString(NGINX_CMD);
         if (StringUtils.isEmpty(cmd)) {
             throw new IllegalArgumentException(NGINX_CMD + " is empty");
         }
-        int i = -1;
+        int i;
         try {
             Process process = Runtime.getRuntime().exec(cmd + " -V");
             i = process.waitFor();
@@ -60,16 +62,17 @@ public class MonitorServiceImpl implements MonitorService {
             throw new IllegalArgumentException(NGINX_CMD + " is incorrect");
         }
 
-        //判断nacos地址
+        // 判断nacos地址
         String nacosAddr = tomlParseResult.getString(NACOS_ADDR);
         if (StringUtils.isEmpty(nacosAddr)) {
             throw new IllegalArgumentException(NACOS_ADDR + " is empty");
         }
-        NamingService namingService = NacosFactory.createNamingService(nacosAddr);
+        String nacosNamespace = tomlParseResult.getString(NACOS_NAMESPACE);
+        String nacosGroup = tomlParseResult.getString(NACOS_GROUP);
+        NamingService namingService = NacosFactory.createNamingService(buildNacosProperties(nacosAddr, nacosNamespace));
 
-        //获取配置项
+        // 获取配置项
         List<DiscoverConfigBO> list = new ArrayList<>();
-        int num = 0;
         Set<String> groupNames = tomlParseResult.keySet();
         groupNames.stream()
                 .filter(groupName -> !groupName.equals(NGINX_CMD) && !groupName.equals(NACOS_ADDR) && !groupName.equals(RELOAD_INTERVAL))
@@ -90,13 +93,13 @@ public class MonitorServiceImpl implements MonitorService {
             throw new IllegalArgumentException(NGINX_CONFIG + "," + NGINX_UPSTREAM + "," + NACOS_SERVICE_NAME + " are at least one group exists ");
         }
 
-        //开始监听nacos
+        // 开始监听nacos
         for (DiscoverConfigBO configBO : list) {
-            namingService.subscribe(configBO.getServiceName(),
+            namingService.subscribe(configBO.getServiceName(), nacosGroup,
                     event -> {
                         try {
-                            List<Instance> instances = namingService.getAllInstances(configBO.getServiceName());
-                            //更新nginx中的upstream
+                            List<Instance> instances = namingService.getAllInstances(configBO.getServiceName(), nacosGroup);
+                            // 更新nginx中的upstream
                             boolean updated = refreshUpstream(instances, configBO.getUpstream(), configBO.getConfigPath());
                             if (updated) {
                                 lastReloadTime.set(System.currentTimeMillis());
@@ -109,7 +112,7 @@ public class MonitorServiceImpl implements MonitorService {
             );
         }
 
-        //开启线程定时reload
+        // 开启线程定时reload
         new Thread(() -> {
             long interval = 1000;
             if (tomlParseResult.contains(RELOAD_INTERVAL)) {
@@ -131,7 +134,7 @@ public class MonitorServiceImpl implements MonitorService {
                     }
                 }
                 try {
-                    //尝试nginx -t ,查看是否有语法错误 0正确 1错误
+                    // 尝试nginx -t ,查看是否有语法错误 0正确 1错误
                     process = Runtime.getRuntime().exec(cmd + " -t");
                     result = process.waitFor(10, TimeUnit.SECONDS);
                     if (!result) {
@@ -142,7 +145,7 @@ public class MonitorServiceImpl implements MonitorService {
                         logger.error("nginx syntax incorrect , execute [{}] to get detail ", (cmd + " -t"));
                         continue;
                     }
-                    //nginx reload
+                    // nginx reload
                     process = Runtime.getRuntime().exec(cmd + " -s reload");
                     result = process.waitFor(10, TimeUnit.SECONDS);
                     if (!result) {
@@ -164,59 +167,62 @@ public class MonitorServiceImpl implements MonitorService {
     }
 
     private boolean refreshUpstream(List<Instance> instances, String nginxUpstream, String nginxConfigPath) {
-        //获取到upstream
+        if (CollectionUtils.isEmpty(instances)) {
+            return false;
+        }
+        // 获取到upstream
         Pattern pattern = Pattern.compile(UPSTREAM_REG.replace(PLACEHOLDER, nginxUpstream));
-        //判断文件是否存在
+        // 判断文件是否存在
         File file = new File(nginxConfigPath);
         if (!file.exists() || !file.isFile()) {
             throw new IllegalArgumentException("file : " + nginxConfigPath + " is not exists or not a file");
         }
-        Long length = file.length();
-        byte[] bytes = new byte[length.intValue()];
+        long length = file.length();
+        byte[] bytes = new byte[(int) length];
         try (FileInputStream fileInputStream = new FileInputStream(file)) {
             fileInputStream.read(bytes);
         } catch (IOException e) {
             e.printStackTrace();
         }
 
-        //获取到配置文件内容
+        // 获取到配置文件内容
         String conf = new String(bytes);
-        //匹配对应的upstream
+        // 匹配对应的upstream
         Matcher matcher = pattern.matcher(conf);
         if (matcher.find()) {
-            String formatSymbol = "";
+            StringBuilder formatSymbol = new StringBuilder();
             String oldUpstream = matcher.group();
-            //计算出旧的upstream到左边的距离
+            // 计算出旧的upstream到左边的距离
             int index = conf.indexOf(oldUpstream);
             while (index != 0 && (conf.charAt(index - 1) == ' ' || conf.charAt(index - 1) == '\t')) {
-                formatSymbol += conf.charAt(index - 1);
+                formatSymbol.append(conf.charAt(index - 1));
                 index--;
             }
 
-            //拼接新的upstream
+            // 拼接新的upstream
             String newUpstream = UPSTREAM_FOMAT.replace(PLACEHOLDER, nginxUpstream);
-            StringBuffer servers = new StringBuffer();
-            if (instances.size() > 0) {
-                for (Instance instance : instances) {
-                    //不健康或不可用的跳过
-                    if (!instance.isHealthy() || !instance.isEnabled()) {
-                        continue;
-                    }
-                    String ip = instance.getIp();
-                    int port = instance.getPort();
-                    servers.append(formatSymbol + "    server " + ip + ":" + port + ";\n");
+            StringBuilder servers = new StringBuilder();
+            // if (CollectionUtils.isNotEmpty(instances)) {
+            for (Instance instance : instances) {
+                // 不健康或不可用的跳过
+                if (!instance.isHealthy() || !instance.isEnabled()) {
+                    continue;
                 }
+                String ip = instance.getIp();
+                int port = instance.getPort();
+                servers.append(formatSymbol).append("    server ").append(ip).append(":").append(port).append(";\n");
             }
+            // }
             if (servers.length() == 0) {
-                //如果没有对应的服务，使用默认的服务防止nginx报错
-                servers.append(formatSymbol + "    server " + DEFAULT_SERVER + ";\n");
+                // 如果没有对应的服务，使用默认的服务防止nginx报错
+                servers.append(formatSymbol).append("    server ").append(DEFAULT_SERVER).append(";\n");
             }
             servers.append(formatSymbol);
             newUpstream = newUpstream.replace(PLACEHOLDER_SERVER, servers.toString());
             if (oldUpstream.equals(newUpstream)) {
                 return false;
             }
-            //替换原有的upstream
+            // 替换原有的upstream
             conf = matcher.replaceAll(newUpstream);
         } else {
             throw new IllegalArgumentException("can not found upstream:" + nginxUpstream);
@@ -228,5 +234,13 @@ public class MonitorServiceImpl implements MonitorService {
             e.printStackTrace();
         }
         return true;
+    }
+
+    private Properties buildNacosProperties(String serverAddr, String namespace) {
+        Properties props = new Properties();
+        props.put("serverAddr", serverAddr);
+        props.put("namespace", namespace);
+        // props.put("group", group);
+        return props;
     }
 }

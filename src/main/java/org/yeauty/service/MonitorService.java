@@ -14,6 +14,8 @@ public interface MonitorService {
 
     String NGINX_CMD = "nginx_cmd";
     String NACOS_ADDR = "nacos_addr";
+    String NACOS_NAMESPACE = "nacos_namespace";
+    String NACOS_GROUP = "nacos_group";
 
     String NGINX_CONFIG = "nginx_config";
     String NGINX_UPSTREAM = "nginx_upstream";
