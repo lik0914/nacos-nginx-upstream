@@ -5,6 +5,6 @@ nacos_group = "test"
 reload_interval = 1000  # 刷新间隔
 
 [atomgit-api]
-nginx_config = "/usr/local/etc/nginx/servers/atomgit-api.conf"  #Nginx config 配置
+nginx_config = "/usr/local/etc/nginx/servers/test-api.conf"  #Nginx config 配置
 nginx_upstream = "test-api"     #upstream 名称
 nacos_service_name = "test-api"   #nacos 服务名
